@@ -1,0 +1,23 @@
+{
+  "name": "dental-lead-engine",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.59.0",
+    "@supabase/supabase-js": "^2.54.0",
+    "apify-client": "^2.13.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "p-limit": "^6.2.0",
+    "undici": "^7.13.0"
+  }
+}
