@@ -18,6 +18,29 @@ const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
 
 const ACTORS = { places: 'compass/crawler-google-places' };
 
+/** ======= TARGETING PRESETS (no pediatric) ======= **/
+const SEARCH_PRESETS = {
+  general: ["dentist","dental clinic","family dentist"],
+  cosmetic: [
+    "cosmetic dentist","veneers","smile makeover","esthetic dentist",
+    "teeth whitening","invisalign dentist","smile design"
+  ],
+  implants: ["dental implants","all-on-4","full arch implants","implant dentist","teeth in a day"],
+  aligners_ortho: ["invisalign dentist","clear aligners","orthodontist","braces","aligner therapy"],
+  prosthodontics: ["prosthodontist","full mouth reconstruction","crowns and bridges","rehabilitation dentist"],
+  digital: [
+    "digital dentistry","CEREC","same day crown","intraoral scanner","3d printer","itero","cbct","digital workflow"
+  ]
+};
+
+// Large DSO/chain names to skip when avoidChains=true
+const DEFAULT_CHAINS = [
+  "Aspen Dental","Western Dental","Pacific Dental","Heartland Dental",
+  "Smile Direct Club","Ideal Dental","Bright Now Dental","DentalWorks",
+  "Affordable Dentures","ClearChoice","Coast Dental","Great Expressions",
+  "Aspire Dental","Midwest Dental","InterDent","MB2 Dental","Dental Care Alliance"
+].map(s => s.toLowerCase());
+
 const domainFrom = (url) => {
   if (!url) return null;
   try { return new URL(url).hostname.replace(/^www\./,'').toLowerCase(); } catch { return null; }
@@ -112,28 +135,39 @@ async function rescore(lead_id) {
   await supabase.from('lead_events').insert({ lead_id, event_type: 'rescored', payload: { ss, tier, qual } });
 }
 
-/** Routes **/
+/** ============= Routes ============= **/
 app.get('/api/health', (_, res) => res.json({ ok: true }));
 
+// Generate: now supports presets & filters
 app.post('/api/generate', async (req, res) => {
-  const { location, maxResults = 40 } = req.body || {};
+  const {
+    location,
+    maxResults = 40,
+    preset = 'general',
+    minRating = 3.8,
+    minReviews = 10,
+    avoidChains = true,
+    includeKeywords = [],   // e.g. ["cerec","intraoral scanner","3d print","smile design"]
+    excludeKeywords = []    // e.g. ["medicaid"]
+  } = req.body || {};
+
   if (!location) return res.status(400).json({ error: 'location required' });
 
   try {
+    const searches = SEARCH_PRESETS[preset] || SEARCH_PRESETS.general;
+
     const input = {
-      searchStringsArray: ["dentist","dental clinic","cosmetic dentist","orthodontist"],
+      searchStringsArray: searches,
       locationQuery: location,
-      maxCrawledPlacesPerSearch: Math.ceil(maxResults/4),
+      maxCrawledPlacesPerSearch: Math.max(1, Math.ceil(maxResults / searches.length)),
       includeWebsite: true,
       skipPlacesWithoutWebsite: true,
       additionalInfo: true,
       enrichPlaceWithBusinessLeads: true,
-      minReviews: 10,
-      minRating: 3.5
+      minReviews,
+      minRating
     };
 
-    // For local dev, webhooks will fail (Apify can't reach localhost).
-    // We'll deploy to Render and trigger /api/generate there.
     const run = await apify.actor(ACTORS.places).call(input, {
       webhooks: [{
         eventTypes: ['ACTOR.RUN.SUCCEEDED','ACTOR.RUN.FAILED'],
@@ -146,7 +180,7 @@ app.post('/api/generate', async (req, res) => {
       actor_id: ACTORS.places,
       run_id: run.id,
       status: run.status,
-      meta: { location, maxResults }
+      meta: { location, maxResults, preset, minRating, minReviews, avoidChains, includeKeywords, excludeKeywords }
     });
 
     res.json({ ok: true, runId: run.id });
@@ -166,7 +200,15 @@ app.post('/api/apify/webhook', async (req, res) => {
     const run = await apify.run(runId);
     const { items } = await apify.dataset(run.defaultDatasetId).listItems();
 
-    const limit = pLimit(6);
+    // load run options for filtering
+    const { data: runMetaRow } = await supabase
+      .from('lead_runs').select('meta').eq('run_id', runId).single();
+    const opts = runMetaRow?.meta || {};
+    const avoidChains = opts.avoidChains ?? true;
+    const includeKeywords = Array.isArray(opts.includeKeywords) ? opts.includeKeywords : [];
+    const excludeKeywords = Array.isArray(opts.excludeKeywords) ? opts.excludeKeywords : [];
+
+    const limit = pLimit(3); // Free Render friendly
     await Promise.all(items.map(item => limit(async () => {
       const base = {
         google_place_id: item.placeId,
@@ -180,11 +222,25 @@ app.post('/api/apify/webhook', async (req, res) => {
         temporarily_closed: item.temporarilyClosed || false, permanently_closed: item.permanentlyClosed || false
       };
 
+      // Skip big chains if requested
+      if (avoidChains && DEFAULT_CHAINS.some(c => (base.name || '').toLowerCase().includes(c))) {
+        return;
+      }
+
       const id = await upsertLead(base);
 
-      // MVP enrichment: fetch homepage text → detect features → LLM specialties
+      // Enrichment
       let siteText = '';
       if (base.website) siteText = await fetchSiteText(base.website);
+
+      // Post-filters on homepage text (digital / cosmetic targeting)
+      const low = (siteText || '').toLowerCase();
+      if (includeKeywords.length && !includeKeywords.some(k => low.includes(String(k).toLowerCase()))) {
+        return;
+      }
+      if (excludeKeywords.length && excludeKeywords.some(k => low.includes(String(k).toLowerCase()))) {
+        return;
+      }
 
       const features = detectFeatures(siteText);
       const llm = await enrichWithLLM({ siteText });
