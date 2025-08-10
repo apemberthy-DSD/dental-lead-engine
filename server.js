@@ -17,7 +17,7 @@ const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
 
 const ACTORS = { places: 'compass/crawler-google-places' };
 
-/** Simple concurrency helper (replaces p-limit) */
+/** Simple concurrency helper (no external deps) */
 async function mapLimit(items, limit, iterator) {
   const results = new Array(items.length);
   let i = 0;
@@ -30,6 +30,21 @@ async function mapLimit(items, limit, iterator) {
   });
   await Promise.all(workers);
   return results;
+}
+
+/** Retry helper for transient fetch errors */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+async function withRetry(fn, { tries = 3, baseMs = 400 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      if (!/fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|socket hang up/i.test(msg)) break;
+      await sleep(baseMs * Math.pow(2, i));
+    }
+  }
+  throw lastErr;
 }
 
 /** ======= TARGETING PRESETS (no pediatric) ======= **/
@@ -47,7 +62,6 @@ const SEARCH_PRESETS = {
   ]
 };
 
-// Large DSO/chain names to skip when avoidChains=true
 const DEFAULT_CHAINS = [
   "Aspen Dental","Western Dental","Pacific Dental","Heartland Dental",
   "Smile Direct Club","Ideal Dental","Bright Now Dental","DentalWorks",
@@ -60,6 +74,41 @@ const domainFrom = (url) => {
   try { return new URL(url).hostname.replace(/^www\./,'').toLowerCase(); } catch { return null; }
 };
 
+/** ---- Supabase helpers (with retries) ---- */
+async function sbSelectOr(table, orCond) {
+  return withRetry(async () => {
+    const q = await supabase.from(table).select('id').or(orCond).limit(1);
+    if (q.error) throw q.error;
+    return q.data;
+  });
+}
+async function sbInsertOne(table, payload) {
+  return withRetry(async () => {
+    const { data, error } = await supabase.from(table).insert(payload).select('id').single();
+    if (error) throw error;
+    return data;
+  });
+}
+async function sbUpdate(table, payload, byId) {
+  return withRetry(async () => {
+    const { error } = await supabase.from(table).update(payload).eq('id', byId);
+    if (error) throw error;
+  });
+}
+async function sbInsert(table, payload) {
+  return withRetry(async () => {
+    const { error } = await supabase.from(table).insert(payload);
+    if (error) throw error;
+  });
+}
+async function sbSelectOne(table, cols, match) {
+  return withRetry(async () => {
+    const { data, error } = await supabase.from(table).select(cols).match(match).single();
+    if (error && error.code !== 'PGRST116') throw error; // no rows found is fine
+    return data || null;
+  });
+}
+
 async function upsertLead(base) {
   const domain = domainFrom(base.website);
   const conds = [
@@ -70,8 +119,8 @@ async function upsertLead(base) {
 
   let existing = null;
   if (conds) {
-    const q = await supabase.from('dental_leads').select('id').or(conds).limit(1);
-    existing = q.data?.[0] || null;
+    const found = await sbSelectOr('dental_leads', conds);
+    existing = found?.[0] || null;
   }
 
   const payload = {
@@ -90,12 +139,11 @@ async function upsertLead(base) {
   };
 
   if (existing) {
-    await supabase.from('dental_leads').update(payload).eq('id', existing.id);
+    await sbUpdate('dental_leads', payload, existing.id);
     return existing.id;
   } else {
-    const { data, error } = await supabase.from('dental_leads').insert(payload).select('id').single();
-    if (error) throw error;
-    return data.id;
+    const d = await sbInsertOne('dental_leads', payload);
+    return d.id;
   }
 }
 
@@ -114,14 +162,14 @@ async function saveTechMvp(lead_id, features, siteText, llm) {
     llm_specialties: llm.specialties || [],
     llm_notes: llm.notes || null
   };
-  const ex = await supabase.from('lead_tech_analysis').select('id').eq('lead_id', lead_id).limit(1);
-  if (ex.data?.length) await supabase.from('lead_tech_analysis').update(row).eq('lead_id', lead_id);
-  else await supabase.from('lead_tech_analysis').insert(row);
+  const existing = await sbSelectOne('lead_tech_analysis', 'id', { lead_id });
+  if (existing) await sbUpdate('lead_tech_analysis', row, existing.id);
+  else await sbInsert('lead_tech_analysis', row);
 }
 
 async function rescore(lead_id) {
-  const { data: lead } = await supabase.from('dental_leads').select('*').eq('id', lead_id).single();
-  const { data: tech } = await supabase.from('lead_tech_analysis').select('*').eq('lead_id', lead_id).single();
+  const lead = await sbSelectOne('dental_leads', '*', { id: lead_id });
+  const tech = await sbSelectOne('lead_tech_analysis', '*', { lead_id });
 
   const techScore = computeTechScore(tech || {});
   const specialties = tech?.llm_specialties || [];
@@ -138,20 +186,47 @@ async function rescore(lead_id) {
 
   const { tier, qual } = tierFromScore(ss.final);
 
-  await supabase.from('dental_leads').update({
-    tech_score: techScore,
-    tech_tier: tier,
-    investment_level: tier,
-    qualification_status: qual,
-    final_score: ss.final,
-    final_score_explanation: tech?.llm_notes || null
-  }).eq('id', lead_id);
+  await withRetry(async () => {
+    const { error } = await supabase.from('dental_leads').update({
+      tech_score: techScore,
+      tech_tier: tier,
+      investment_level: tier,
+      qualification_status: qual,
+      final_score: ss.final,
+      final_score_explanation: tech?.llm_notes || null
+    }).eq('id', lead_id);
+    if (error) throw error;
+  });
 
-  await supabase.from('lead_events').insert({ lead_id, event_type: 'rescored', payload: { ss, tier, qual } });
+  await sbInsert('lead_events', { lead_id, event_type: 'rescored', payload: { ss, tier, qual } });
 }
 
 /** ============= Routes ============= **/
 app.get('/api/health', (_, res) => res.json({ ok: true }));
+
+// Deep health: check env & Supabase connectivity (no secrets shown)
+app.get('/api/debug/connections', async (_, res) => {
+  const env = {
+    publicBaseUrl: process.env.PUBLIC_BASE_URL || '',
+    supabaseUrlLooksOk: !!process.env.SUPABASE_URL && /\.supabase\.co$/.test(new URL(process.env.SUPABASE_URL).hostname),
+    supabaseKeyLen: (process.env.SUPABASE_SERVICE_KEY || '').length,
+    apifyKeyLen: (process.env.APIFY_API_TOKEN || '').length,
+    anthropicKeyLen: (process.env.ANTHROPIC_API_KEY || '').length
+  };
+
+  let supabasePing = { ok: false, error: null, count: null };
+  try {
+    const { error, count } = await supabase
+      .from('dental_leads')
+      .select('id', { count: 'exact', head: true });
+    if (error) supabasePing.error = { message: error.message, code: error.code || null };
+    else supabasePing.ok = true, supabasePing.count = count ?? 0;
+  } catch (e) {
+    supabasePing.error = { message: String(e?.message || e) };
+  }
+
+  res.json({ ok: true, env, supabasePing });
+});
 
 // Generate: use actor().start so it returns immediately
 app.post('/api/generate', async (req, res) => {
@@ -162,8 +237,8 @@ app.post('/api/generate', async (req, res) => {
     minRating = 3.8,
     minReviews = 10,
     avoidChains = true,
-    includeKeywords = [],   // e.g. ["cerec","intraoral scanner","3d print","smile design"]
-    excludeKeywords = []    // e.g. ["medicaid"]
+    includeKeywords = [],
+    excludeKeywords = []
   } = req.body || {};
 
   if (!location) return res.status(400).json({ error: 'location required' });
@@ -190,7 +265,7 @@ app.post('/api/generate', async (req, res) => {
       }]
     });
 
-    await supabase.from('lead_runs').insert({
+    await sbInsert('lead_runs', {
       source: 'google_places',
       actor_id: ACTORS.places,
       run_id: run.id,
@@ -227,7 +302,6 @@ app.post('/api/apify/webhook', async (req, res) => {
 
     let finalDatasetId = datasetId;
     if (!finalDatasetId && runId) {
-      // Fallback: fetch the run to get its defaultDatasetId
       const run = await apify.run(runId);
       finalDatasetId = run?.defaultDatasetId || null;
     }
@@ -238,9 +312,7 @@ app.post('/api/apify/webhook', async (req, res) => {
 
     const { items } = await apify.dataset(finalDatasetId).listItems({ limit: 1000 });
 
-    // load run options for filtering
-    const { data: runMetaRow } = await supabase
-      .from('lead_runs').select('meta').eq('run_id', runId).single();
+    const runMetaRow = await sbSelectOne('lead_runs','meta',{ run_id: runId });
     const opts = runMetaRow?.meta || {};
     const avoidChains = opts.avoidChains ?? true;
     const includeKeywords = Array.isArray(opts.includeKeywords) ? opts.includeKeywords : [];
@@ -259,25 +331,16 @@ app.post('/api/apify/webhook', async (req, res) => {
         temporarily_closed: item.temporarilyClosed || false, permanently_closed: item.permanentlyClosed || false
       };
 
-      // Skip big chains if requested
-      if (avoidChains && DEFAULT_CHAINS.some(c => (base.name || '').toLowerCase().includes(c))) {
-        return;
-      }
+      if (avoidChains && DEFAULT_CHAINS.some(c => (base.name || '').toLowerCase().includes(c))) return;
 
       const id = await upsertLead(base);
 
-      // Enrichment
       let siteText = '';
       if (base.website) siteText = await fetchSiteText(base.website);
 
-      // Post-filters on homepage text (digital / cosmetic targeting)
       const low = (siteText || '').toLowerCase();
-      if (includeKeywords.length && !includeKeywords.some(k => low.includes(String(k).toLowerCase()))) {
-        return;
-      }
-      if (excludeKeywords.length && excludeKeywords.some(k => low.includes(String(k).toLowerCase()))) {
-        return;
-      }
+      if (includeKeywords.length && !includeKeywords.some(k => low.includes(String(k).toLowerCase()))) return;
+      if (excludeKeywords.length && excludeKeywords.some(k => low.includes(String(k).toLowerCase()))) return;
 
       const features = detectFeatures(siteText);
       const llm = await enrichWithLLM({ siteText });
@@ -285,10 +348,16 @@ app.post('/api/apify/webhook', async (req, res) => {
       await saveTechMvp(id, features, siteText, llm);
       await rescore(id);
 
-      await supabase.from('lead_events').insert({ lead_id: id, event_type: 'created', payload: { runId, datasetId: finalDatasetId } });
+      await sbInsert('lead_events', { lead_id: id, event_type: 'created', payload: { runId, datasetId: finalDatasetId } });
     });
 
-    await supabase.from('lead_runs').update({ status: 'succeeded', finished_at: new Date() }).eq('run_id', runId);
+    await withRetry(async () => {
+      const { error } = await supabase.from('lead_runs')
+        .update({ status: 'succeeded', finished_at: new Date() })
+        .eq('run_id', runId);
+      if (error) throw error;
+    });
+
   } catch (e) {
     console.error('webhook', e);
   }
