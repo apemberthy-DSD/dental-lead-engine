@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { ApifyClient } = require('apify-client');
-const pLimit = require('p-limit');
 
 const { fetchSiteText } = require('./webtext');
 const { enrichWithLLM } = require('./llm');
@@ -17,6 +16,21 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
 
 const ACTORS = { places: 'compass/crawler-google-places' };
+
+/** Simple concurrency helper (replaces p-limit) */
+async function mapLimit(items, limit, iterator) {
+  const results = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.max(1, limit) }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) break;
+      results[idx] = await iterator(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 /** ======= TARGETING PRESETS (no pediatric) ======= **/
 const SEARCH_PRESETS = {
@@ -232,8 +246,7 @@ app.post('/api/apify/webhook', async (req, res) => {
     const includeKeywords = Array.isArray(opts.includeKeywords) ? opts.includeKeywords : [];
     const excludeKeywords = Array.isArray(opts.excludeKeywords) ? opts.excludeKeywords : [];
 
-    const limit = pLimit(3); // Free Render friendly
-    await Promise.all(items.map(item => limit(async () => {
+    await mapLimit(items, 3, async (item) => {
       const base = {
         google_place_id: item.placeId,
         name: item.title,
@@ -273,7 +286,7 @@ app.post('/api/apify/webhook', async (req, res) => {
       await rescore(id);
 
       await supabase.from('lead_events').insert({ lead_id: id, event_type: 'created', payload: { runId, datasetId: finalDatasetId } });
-    })));
+    });
 
     await supabase.from('lead_runs').update({ status: 'succeeded', finished_at: new Date() }).eq('run_id', runId);
   } catch (e) {
