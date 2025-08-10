@@ -64,6 +64,7 @@ async function upsertLead(base) {
     google_place_id: base.google_place_id || null,
     name: base.name,
     address: base.address,
+    domain: domain || null,
     city: base.city, state: base.state, postal_code: base.postal_code,
     latitude: base.latitude, longitude: base.longitude,
     phone: base.phone, website: base.website, email: base.email,
@@ -138,7 +139,7 @@ async function rescore(lead_id) {
 /** ============= Routes ============= **/
 app.get('/api/health', (_, res) => res.json({ ok: true }));
 
-// Generate: now supports presets & filters
+// Generate: use actor().start so it returns immediately
 app.post('/api/generate', async (req, res) => {
   const {
     location,
@@ -168,7 +169,7 @@ app.post('/api/generate', async (req, res) => {
       minRating
     };
 
-    const run = await apify.actor(ACTORS.places).call(input, {
+    const run = await apify.actor(ACTORS.places).start(input, {
       webhooks: [{
         eventTypes: ['ACTOR.RUN.SUCCEEDED','ACTOR.RUN.FAILED'],
         requestUrl: `${process.env.PUBLIC_BASE_URL}/api/apify/webhook`
@@ -190,15 +191,38 @@ app.post('/api/generate', async (req, res) => {
   }
 });
 
+// Robust webhook: resolve datasetId from multiple places; bail gracefully if missing
 app.post('/api/apify/webhook', async (req, res) => {
   res.status(200).json({ received: true }); // ack immediately
 
   try {
-    const runId = req.body?.resource?.id || req.body?.id || req.body?.resource?.defaultDatasetId?.split('/').pop();
-    if (!runId) return;
+    const body = req.body || {};
+    const datasetRaw =
+      body?.resource?.defaultDatasetId ||
+      body?.defaultDatasetId ||
+      body?.datasetId ||
+      null;
 
-    const run = await apify.run(runId);
-    const { items } = await apify.dataset(run.defaultDatasetId).listItems();
+    const datasetId = datasetRaw ? String(datasetRaw).split('/').pop() : null;
+    const runId = body?.resource?.id || body?.id || null;
+
+    if (!datasetId && !runId) {
+      console.warn('webhook: no datasetId or runId in payload');
+      return;
+    }
+
+    let finalDatasetId = datasetId;
+    if (!finalDatasetId && runId) {
+      // Fallback: fetch the run to get its defaultDatasetId
+      const run = await apify.run(runId);
+      finalDatasetId = run?.defaultDatasetId || null;
+    }
+    if (!finalDatasetId) {
+      console.warn('webhook: unable to resolve datasetId');
+      return;
+    }
+
+    const { items } = await apify.dataset(finalDatasetId).listItems({ limit: 1000 });
 
     // load run options for filtering
     const { data: runMetaRow } = await supabase
@@ -248,7 +272,7 @@ app.post('/api/apify/webhook', async (req, res) => {
       await saveTechMvp(id, features, siteText, llm);
       await rescore(id);
 
-      await supabase.from('lead_events').insert({ lead_id: id, event_type: 'created', payload: { runId } });
+      await supabase.from('lead_events').insert({ lead_id: id, event_type: 'created', payload: { runId, datasetId: finalDatasetId } });
     })));
 
     await supabase.from('lead_runs').update({ status: 'succeeded', finished_at: new Date() }).eq('run_id', runId);
