@@ -15,7 +15,17 @@ app.use(cors({ origin: (process.env.CORS_ORIGIN || '').split(',').filter(Boolean
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
 
-const ACTORS = { places: 'compass/crawler-google-places' };
+const ACTORS = {
+  places: 'compass/crawler-google-places',
+  rag: process.env.APIFY_RAG_ACTOR || 'apify/rag-web-browser',
+  deep: process.env.APIFY_DEEP_CONTACTS_ACTOR || 'peterasorensen/snacci'
+};
+
+async function runActorAndGetItems(actorSlug, input) {
+  const run = await apify.actor(actorSlug).call(input);
+  const { items } = await apify.dataset(run.defaultDatasetId).listItems({ limit: 1000 });
+  return { run, items };
+}
 
 /** Simple concurrency helper (no external deps) */
 async function mapLimit(items, limit, iterator) {
@@ -335,12 +345,57 @@ app.post('/api/apify/webhook', async (req, res) => {
 
       const id = await upsertLead(base);
 
-      let siteText = '';
-      if (base.website) siteText = await fetchSiteText(base.website);
+      const logPrefix = `[lead] ${base.google_place_id || base.name || ''}`;
+const t0 = Date.now();
 
-      const low = (siteText || '').toLowerCase();
-      if (includeKeywords.length && !includeKeywords.some(k => low.includes(String(k).toLowerCase()))) return;
-      if (excludeKeywords.length && excludeKeywords.some(k => low.includes(String(k).toLowerCase()))) return;
+// (1) Prefer RAG actor for website text; fallback to local fetch
+let siteText = '';
+if (base.website) {
+  try {
+    console.log(logPrefix, 'RAG start →', ACTORS.rag);
+    const ragInput = {
+      query: base.website,                // single URL mode
+      outputFormats: ['markdown'],
+      scrapingTool: 'raw-http',           // fast for most dental sites
+      requestTimeoutSecs: 40
+    };
+    const { items: ragItems } = await runActorAndGetItems(ACTORS.rag, ragInput);
+    const first = ragItems?.find(i => i?.markdown) || ragItems?.[0] || {};
+    siteText = String(first.markdown || '').slice(0, 15000);
+    if (!siteText) throw new Error('RAG returned no markdown');
+    console.log(logPrefix, 'RAG done. chars=', siteText.length);
+  } catch (e) {
+    console.warn(logPrefix, 'RAG failed → fallback fetchSiteText:', e?.message || e);
+    siteText = await fetchSiteText(base.website);
+  }
+}
+
+// (2) Keyword filters on the text we got
+const low = (siteText || '').toLowerCase();
+if (includeKeywords.length && !includeKeywords.some(k => low.includes(String(k).toLowerCase()))) return;
+if (excludeKeywords.length && excludeKeywords.some(k => low.includes(String(k).toLowerCase()))) return;
+
+// (3) After content passes filters, run deep contacts (snacci)
+let deepContacts = [];
+if (base.website) {
+  try {
+    console.log(logPrefix, 'Deep contacts start →', ACTORS.deep);
+    const deepInput = {
+      websites: [base.website],
+      scrapeTypes: ['emails','phoneNumbers','socialMedia'],
+      removeDuplicates: true,
+      maxDepth: 2,
+      maxLinksPerPage: 100
+    };
+    const { items } = await runActorAndGetItems(ACTORS.deep, deepInput);
+    deepContacts = Array.isArray(items) ? items : [];
+    await sbInsert('lead_events', { lead_id: id, event_type: 'contacts_found', payload: { count: deepContacts.length } });
+  } catch (e) {
+    console.warn(logPrefix, 'Deep contacts failed:', e?.message || e);
+  }
+}
+
+console.log(logPrefix, 'processed in', (Date.now() - t0) + 'ms');
 
       const features = detectFeatures(siteText);
       const llm = await enrichWithLLM({ siteText });
