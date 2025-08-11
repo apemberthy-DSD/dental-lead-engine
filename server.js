@@ -11,6 +11,10 @@ const { detectFeatures, computeTechScore, subscores, tierFromScore } = require('
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cors({ origin: (process.env.CORS_ORIGIN || '').split(',').filter(Boolean) || true }));
+app.use((req, _res, next) => {
+  try { console.log('REQ', req.method, req.url); } catch (_) {}
+  next();
+});
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
@@ -290,6 +294,10 @@ app.post('/api/generate', async (req, res) => {
 });
 
 // Robust webhook: resolve datasetId from multiple places; bail gracefully if missing
+app.get('/api/apify/webhook', (_req, res) => {
+  console.log('WEBHOOK GET HIT');
+  res.json({ ok: true, method: 'GET' });
+});
 app.post('/api/apify/webhook', async (req, res) => {
   res.status(200).json({ received: true }); // ack immediately
 
