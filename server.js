@@ -325,7 +325,7 @@ app.post('/api/apify/webhook', async (req, res) => {
 
     let finalDatasetId = datasetId;
     if (!finalDatasetId && runId) {
-      const run = await apify.run(runId);
+      const run = await apify.run(runId).get();
       finalDatasetId = run?.defaultDatasetId || null;
     }
     if (!finalDatasetId) {
